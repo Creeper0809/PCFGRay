@@ -1,0 +1,25 @@
+apiVersion: skaffold/v4beta6
+kind: Config
+metadata:
+  name: pcfg-ray-dev
+build:
+  artifacts:
+    - image: ray-dev
+      context: .
+      docker:
+        dockerfile: Dockerfile
+      sync:
+        manual:
+          - src: '../PCFGCracking/lib/**/*.py'
+            dest: lib/
+manifests:  # ❗️이제 여기로 옮겨야 함!
+  rawYaml:
+    - k8s/raycluster.yaml
+
+deploy:
+  kubectl: {}
+portForward:
+  - resourceType: service
+    resourceName: raycluster-basic-head-svc
+    port: 8265
+    localPort: 8265
