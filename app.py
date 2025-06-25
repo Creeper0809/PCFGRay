@@ -6,14 +6,18 @@ import hashlib
 import ray
 from pcfg_lib.guess.pcfg.pcfg_guesser import PCFGGuesser
 from pcfg_lib.guess.util.priority_queue import PcfgQueue
+from ray import runtime_context
+from ray._private.services import get_node_ip_address
+
 
 # ──────────────────────────────────── MainNode ────────────────────────────────────
 @ray.remote
 class MainNode:
     def __init__(self, config: dict):
-        # PCFG 및 큐 초기화
-        self.pcfg = PCFGGuesser(config)
-        self.queue = PcfgQueue(self.pcfg)
+        # 설정 보관만: 실제 PCFG 초기화는 별도 메서드로 지연 수행
+        self.config = config
+        self.pcfg = None
+        self.queue = None
 
         # 상태 변수
         self.seed_counter = 0
@@ -22,32 +26,29 @@ class MainNode:
         self.guess_rate = self.compare_rate = 0
         self.guess_workers = []
         self.compare_workers = []
-        self.target_hash = config.get("target_hash")
+        self.target_hash = "F0B55E2312C383B8C9DCDD0C875C42AA7012AB96025D744091318CE00EB80569"
         self._shutdown_event = threading.Event()
 
-        print(f"[MainNode] roots={len(self.queue._heap)}", flush=True)
+        print(f"[MainNode] actor initialized", flush=True)
 
-        # 오토스케일 및 부트스트랩 스레드 시작
+        # 초기화 작업: PCFGGuesser 생성 등 지연 수행
+        threading.Thread(target=self._initialize_heavy, daemon=True).start()
         threading.Thread(target=self._auto_scale_loop, daemon=True).start()
-        threading.Thread(target=self._delayed_bootstrap, daemon=True).start()
 
-    # 초기 워커 부트스트랩 (Actor ready 확보 후 실행)
-    def _delayed_bootstrap(self):
+    def _initialize_heavy(self):
+        # Actor ready 확인 후에 무거운 초기화
         time.sleep(1)
-        # GuessWorker 2개
+        # PCFGGuesser 및 큐 초기화
+        self.pcfg = PCFGGuesser(self.config)
+        self.queue = PcfgQueue(self.pcfg)
+        print(f"[MainNode] PCFG & queue ready, roots={len(self.queue._heap)}", flush=True)
+
+        # 초기 워커 부트스트랩
         for _ in range(2):
-            gw = GuessWorker.options(
-                num_cpus=1,
-                memory=600 * 1024**2
-            ).remote()
-            # 내부 메서드로 직접 등록
+            gw = GuessWorker.options(num_cpus=1).remote()
             self.register_guess_worker(gw)
             gw.run.remote()
-        # CompareWorker 1개
-        cw = CompareWorker.options(
-                    num_cpus=0.5,
-                    memory=200 * 1024**2
-                ).remote()
+        cw = CompareWorker.options(num_cpus=0.5).remote()
         self.register_compare_worker(cw)
 
     # ───────── 큐 & 통계 ─────────
@@ -56,6 +57,9 @@ class MainNode:
         return sid
 
     def get_task_batch(self, n=1):
+        # Heavy init이 안 끝나면 빈 배치 반환
+        if self.queue is None:
+            return []
         batch = []
         for _ in range(n):
             node = self.queue.pop()
@@ -64,6 +68,7 @@ class MainNode:
             sid = self.next_seed()
             self.active_tasks[sid] = node
             batch.append((sid, node))
+        print(batch, flush=True)
         return batch
 
     def report_children(self, sid, children):
@@ -75,7 +80,7 @@ class MainNode:
     def submit_guess(self, sid, guess):
         with self._lock:
             self.guess_rate += 1
-        if self.compare_workers:
+        if self.compare_workers and self.pcfg:
             self.compare_workers[sid % len(self.compare_workers)].compare.remote(
                 sid, guess, self.target_hash
             )
@@ -101,21 +106,11 @@ class MainNode:
             with self._lock:
                 backlog = self.guess_rate - self.compare_rate
                 self.guess_rate = self.compare_rate = 0
-            # 비교 워커 추가
             if backlog > 100 and len(self.compare_workers) < 10:
-                cw = CompareWorker.options(
-                    num_cpus=0.5,
-                    memory=200 * 1024**2,
-                    resources={"worker_node": 0.005}
-                ).remote()
+                cw = CompareWorker.options(num_cpus=0.5).remote()
                 self.register_compare_worker(cw)
-            # 추측 워커 추가
             elif backlog < -50 and len(self.guess_workers) < 20:
-                gw = GuessWorker.options(
-                    num_cpus=1,
-                    memory=600 * 1024**2,
-                    resources={"worker_node": 0.01}
-                ).remote()
+                gw = GuessWorker.options(num_cpus=1).remote()
                 self.register_guess_worker(gw)
                 gw.run.remote()
 
@@ -133,13 +128,18 @@ class MainNode:
 @ray.remote
 class GuessWorker:
     def __init__(self):
-        # MainNode actor handle 조회
         self.main = ray.get_actor("MainNode", namespace="pcfg")
-        self.pcfg = PCFGGuesser({"log": False})
+        self.pcfg = None
         self.running = True
 
     def run(self):
         pid = os.getpid()
+        # 지연 초기화: 메인 노드 준비 대기
+        while self.pcfg is None:
+            try:
+                self.pcfg = PCFGGuesser({"log": False})
+            except Exception:
+                time.sleep(0.1)
         print(f"[GuessWorker][{pid}] start", flush=True)
         while self.running:
             try:
@@ -150,12 +150,12 @@ class GuessWorker:
                 for sid, node in batch:
                     self.main.report_children.remote(sid, self.pcfg.find_children(node))
                     for chunk in self.pcfg.split_structures(node, value=1):
+                        print(json.dumps({
+                            "event": "password_guessed",
+                            "input": get_node_ip_address(),
+                            "guess": [structure.serialize() for structure in chunk],
+                        }), flush=True)
                         for pw in self.pcfg.guess(chunk):
-                            print(json.dumps({
-                                                "event": "password_guessed",
-                                                "input": [structure.serialize() for structure in chunk],
-                                                "guess": pw
-                                                }), flush=True)
                             self.main.submit_guess.remote(sid, pw)
             except ray.exceptions.RayActorError:
                 print(f"[GuessWorker][{pid}] MainNode gone → exit", flush=True)
@@ -199,7 +199,10 @@ if __name__ == "__main__":
     except ValueError:
         main = MainNode.options(
             name="MainNode", namespace="pcfg", lifetime="detached",
-            resources={"main_node_host": 0.001}, num_cpus=1
+            resources={"main_node_host": 0.001}, num_cpus=1,
+            memory=8 * 1024**3,
+            max_restarts=1,
+            max_task_retries=1
         ).remote({"target_hash": target_hash})
         ray.get(main.ping.remote())
         print("[Driver] new MainNode created")
